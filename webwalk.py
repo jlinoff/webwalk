@@ -26,6 +26,7 @@ finding data files to download.
 # Copyright (c) Joe Linoff
 import argparse
 import getpass
+import inspect
 import os
 import re
 import socket
@@ -44,8 +45,8 @@ except ImportError:
     ConnectionError = OSError  # only in python3
 
 
-VERSION = '0.1.0'  # Initial release.
-
+#VERSION = '0.1.0'  # Initial release.
+VERSION = '0.2.0'  # Don't replicate files that already exist, added -c, --debug.
 
 class MyHtmlParser(HTMLParser):
     '''
@@ -141,6 +142,17 @@ class MyHtmlParser(HTMLParser):
 
     def handle_data(self, data):
         pass
+
+
+def debug(opts, msg):
+    '''
+    Display a debug message.
+    '''
+    if opts.debug:
+        parent_frame = inspect.currentframe().f_back
+        lineno = parent_frame.f_lineno
+        fct = parent_frame.f_code.co_name
+        sys.stderr.write('DEBUG:{}:{} {}\n'.format(fct, lineno, msg))
 
 
 def clean_url(url):
@@ -260,7 +272,7 @@ def display(url, opts):
     return True  # display it
 
 
-def report(url, opts, response, info, outpath, depth, parent):
+def report(url, opts, response, info, reppath, cppath, depth, parent):
     '''
     Report the URL.
 
@@ -309,7 +321,11 @@ def report(url, opts, response, info, outpath, depth, parent):
         write('{}'.format(url))
 
     if opts.replicate:
-        write(' --> {}'.format(outpath))
+        write(' --> {}'.format(reppath))
+
+    if opts.copy:
+        write(' ==> {}'.format(cppath))
+
     write('\n')
 
     if opts.verbose >= 3:  # header
@@ -319,34 +335,55 @@ def report(url, opts, response, info, outpath, depth, parent):
     return data
 
 
-def replicate_outpath(url, opts):
+def create_reppath(url, opts):
     '''
-    Get the output file name.
+    Get the output file name for replication.
+    This includes the relative path.
     '''
     if opts.replicate:
         pos = len(opts.URL)
         if url.endswith('/'):
             url += 'index.html'
-        outpath = url[pos:]
-        if outpath.startswith('/') is False:
-            outpath = '/' + outpath
-        outpath = clean_url(opts.replicate + outpath)
-        return outpath
+        reppath = url[pos:]
+        if reppath.startswith('/') is False:
+            reppath = '/' + reppath
+        reppath = clean_url(opts.replicate + reppath)
+        debug(opts, 'reppath "{}"'.format(reppath))
+        return reppath
     return None
 
 
-def replicate(url, opts, response, data, outpath):
+def create_cppath(url, opts):
     '''
-    Replicate the file locally.
+    Create the output file name for copy.
+    This is simpler than replication.
+    There is no relative path.
     '''
-    if opts.replicate:
-        if data is None:
-            data = read_url_data(response)
-        dirpath = os.path.dirname(outpath)
+    if opts.copy:
+        if url.endswith('/'):
+            url += 'index.html'
+        pos = url.rfind('/')
+        cppath = os.path.join(opts.copy, url[pos+1:])  # skip the /
+        debug(opts, 'cppath "{}"'.format(cppath))
+        return cppath
+    return None
+
+
+def copy_to_file(url, opts, response, data, outfile):
+    '''
+    Copy the outfile locally.
+    '''
+    if data is None:
+        data = read_url_data(response)
+    if os.path.exists(outfile) is False:
+        dirpath = os.path.dirname(outfile)
         if os.path.exists(dirpath) is False:
             os.makedirs(dirpath)
-        with open(outpath, 'wb') as ofp:
-            ofp.write(data)
+        with open(outfile, 'wb') as ofp:
+            try:
+                ofp.write(data)
+            except TypeError:
+                ofp.write(data.encode('utf-8'))
     return data
 
 
@@ -366,23 +403,41 @@ def walk(url, opts, dups, depth=0, recurse=True, parent=None):
     '''
     Display the current page and continue walking over the web tree.
     '''
+    debug(opts, 'processing url {}'.format(url))
     url = clean_url(url)
     if proceed(url, opts, dups, depth) is False:
+        debug(opts, 'ignoring url {}'.format(url))
         return
 
     response = openurl(url, opts)
     if response is None:
+        debug(opts, 'no repsonse for url {}'.format(url))
         return
 
     info = response.info()
     data = None
 
     if display(url, opts):
-        outpath = replicate_outpath(url, opts)
-        data = report(url, opts, response, info, outpath, depth, parent)
-        data = replicate(url, opts, response, data, outpath)
+        debug(opts, 'displaying url {}'.format(url))
+
+        # This is a filtered file. Report it.
+        # Need the path names for reporting before the actual copy.
+        reppath = create_reppath(url, opts)
+        cppath = create_cppath(url, opts)
+
+        # Report.
+        data = report(url, opts, response, info, reppath, cppath, depth, parent)
+
+        # Copy.
+        if opts.replicate:
+            data = copy_to_file(url, opts, response, data, reppath)
+        if opts.copy:
+            data = copy_to_file(url, opts, response, data, cppath)
+    else:
+        debug(opts, 'not displaying url {}'.format(url))
 
     if is_html(info) and recurse is True:
+        debug(opts, 'recursing on url {}'.format(url))
         html = read_url_data(response) if data is None else data
         parser = MyHtmlParser()
         parser.analyze(url, html)  # populate m_list
@@ -434,41 +489,43 @@ examples:
   $ # Example 2. Walk a HTTP site
   $ {0} http://internal.example.com
 
-  $ # Example 3. Walk a HTTP site, show the page sizes
-  $ {0} -v http://internal.example.com
-
-  $ # Example 4. Walk a HTTP site, show the page sizes and types
+  $ # Example 3. Walk a HTTP site, show the page sizes and types
   $ {0} -v -v http://internal.example.com
 
-  $ # Example 5. Walk a HTTP site, show the page sizes, only display 2 levels
-  $ {0} -m 2 -v http://internal.example.com
+  $ # Example 4. Walk a HTTP site, show the page sizes, only display 2 levels
+  $ {0} -d 2 -v http://internal.example.com
 
-  $ # Example 6. Walk a HTTPS site
+  $ # Example 5. Walk a HTTPS site
   $ #            Look at the -p and -P options if you do not want to
   $ #            be prompted for the user password.
   $ {0} -u username https://example.com
   Password for username?
 
-  $ # Example 7. Exclude URLs that contain /tmp/
+  $ # Example 6. Exclude URLs that contain /tmp/
   $ {0} -e '/tmp/' http://example.com
 
-  $ # Example 8. Only report the ".txt" files
+  $ # Example 7. Only report the ".txt" files
   $ {0} -f '\.txt$' http://example.com
 
-  $ # Example 9. Replicate the ".txt" files locally
+  $ # Example 8. Replicate the ".txt" files locally
   $ mkdir /tmp/mirror
   $ {0} -f '\.txt$' -r /tmp/mirror http://example.com
 
-  $ # Example 10. Replicate all files locally
+  $ # Example 9. Replicate all files locally
   $ mkdir /tmp/mirror
   $ {0} -v -r /tmp/mirror http://example.com
   $ tree /tmp/mirror  # see whats there
 
-  $ # Example 11. Replicate "index.html" files locally
+  $ # Example 10. Replicate "index.html" files locally
   $ #             This is a special case because the "index.html"
   $ #             is implied.
   $ mkdir /tmp/mirror
-  $ {0} -f 'index\\.html$' -v -r /tmp/mirror http://example.com
+  $ {0} -f 'index\.html$' -v -r /tmp/mirror http://example.com
+
+  $ # Example 11. Copy all .tar.bz2 files to a local directory.
+  $ #             Ignore the web site hierarchy.
+  $ mkdir /tmp/cache
+  $ {0} -f '\.tar\.bz2l$' -v -c /tmp/cache http://example.com
 
   $ # Example 12. Print a hierarchical port using relative url paths.
   $ #             You can change the spacing with the -s option.
@@ -492,6 +549,17 @@ examples:
                                      usage=usage(),
                                      epilog=epilog())
 
+    parser.add_argument('-c', '--copy',
+                        action='store',
+                        type=str,
+                        metavar=('DIR'),
+                        help='''Copy all filtered files to a single directory.
+This is useful for collecting data or package files that
+have unique names.
+If you use it without a filter, everything will be copied to a single
+directory.
+ ''')
+
     parser.add_argument('-d', '--depth',
                         action='store',
                         type=int,
@@ -500,6 +568,12 @@ examples:
                         help='''The maximum depth to search.
 The default is no maximum.
  ''')
+
+    parser.add_argument('--debug',
+                        action='store_true',
+                        help='''Display debugging information.
+This is useful for debugging regex patterns.
+  ''')
 
     parser.add_argument('-e', '--exclude',
                         action='append',
@@ -536,7 +610,7 @@ Use -s to change the number of spaces to indent per level.
 Indenting does not work very well with filters because the parents
 are typically filtered out.
  ''')
-    
+
     parser.add_argument('-n', '--no-warnings',
                         action='store_true',
                         help='''Disable warnings.
@@ -548,7 +622,7 @@ are typically filtered out.
                         metavar=('FILE'),
                         help='''A file that contains the password.
  ''')
-    
+
     parser.add_argument('-P', '--password',
                         action='store',
                         type=str,
@@ -558,7 +632,7 @@ This should only be used in a script with 0700
 permissions because command line arguments can
 be seen in the shell history.
  ''')
-    
+
     parser.add_argument('-r', '--replicate',
                         action='store',
                         type=str,
@@ -584,7 +658,7 @@ external sites.
 If -I is not specified, this option is ignored.
 The default is %(default)s.
  ''')
-    
+
     parser.add_argument('-u', '--username',
                         action='store',
                         type=str,
@@ -592,7 +666,7 @@ The default is %(default)s.
 If no password option like -p or -P is specified, the user
 is prompted for the password.
  ''')
-    
+
     parser.add_argument('-v', '--verbose',
                         action='count',
                         default=0,
@@ -616,7 +690,7 @@ is prompted for the password.
     def err(msg):
         sys.stderr.write('ERROR: {}\n'.format(msg))
         sys.exit(1)
-        
+
     # Handle the user name and password data.
     # If the user specified a username, then we need to get the
     # associated password.
@@ -644,8 +718,17 @@ is prompted for the password.
 
     # Handle replication.
     if opts.replicate:
+        if opts.copy:
+            err('cannot specify concurrent copy and replication operations')
         if os.path.exists(opts.replicate) is False:
             err('replication directory does not exist: {}'.format(opts.replicate))
+
+    # Handle copy.
+    if opts.copy:
+        if opts.replicate:
+            err('cannot specify concurrent copy and replication operations')
+        if os.path.exists(opts.copy) is False:
+            err('replication directory does not exist: {}'.format(opts.copy))
 
     return opts
 
