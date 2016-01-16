@@ -46,7 +46,8 @@ except ImportError:
 
 
 #VERSION = '0.1.0'  # Initial release.
-VERSION = '0.2.0'  # Don't replicate files that already exist, added -c, --debug.
+#VERSION = '0.2.0'  # Don't replicate files that already exist, added -c, --debug.
+VERSION = '0.3.0'  # Fixed clean_url() to avoid infinite loop, report HTMLs as dirs
 
 class MyHtmlParser(HTMLParser):
     '''
@@ -68,8 +69,7 @@ class MyHtmlParser(HTMLParser):
 
     @staticmethod
     def __clean_url(url):
-        clean = url.replace('://', '@@@').replace('//', '/').replace('@@@', '://')
-        return clean
+        return clean_url(url)  # DRY but not encapsulated
 
     @staticmethod
     def __get_attr(attrs, key):
@@ -159,8 +159,25 @@ def clean_url(url):
     '''
     Clean a URL to remove extraneous slashes.
     '''
-    clean = url.replace('://', '@@@').replace('//', '/').replace('@@@', '://')
-    return clean
+    path = url.split('?', 1)[0]
+    pos = path.find('://')
+    if pos >= 0:
+        # ex. http://a/b/c/d/../e//f/g
+        # ex. https://a/b/c/d/../e//f/g
+        prefix = path[:pos+2]
+        path = path[pos+2:]
+        path = prefix + os.path.abspath(path)
+    elif path.startswith('/'):
+        # ex. /a/b/c/d/../e//f/g
+        path = os.path.abspath(path)
+    else:
+        # Make it an absolute path temporarily to
+        # fix things like:
+        #   a/b//c//d/../e
+        path = os.path.abspath('/' + path)
+        path = path[1:]
+
+    return path
 
 
 def proceed(url, opts, dups, depth):
@@ -310,10 +327,16 @@ def report(url, opts, response, info, reppath, cppath, depth, parent):
     if opts.relurl:
         if url.startswith(str(parent)):
             relurl = url[len(parent):]
+            if relurl.startswith('/'):
+                relurl = relurl[1:]
+            if relurl.endswith('/') is False and is_html(info):
+                relurl += '/'
         elif str(parent).startswith(str(url)):
             # Look for backward references.
             tmp = parent[len(url):]
             relurl = ''.join(['../' for _ in range(string.count(tmp, '/'))])
+            if relurl.endswith('/') is False and is_html(info):
+                relurl += '/'
         else:
             relurl = url
         write('{}'.format(relurl))
@@ -405,13 +428,14 @@ def walk(url, opts, dups, depth=0, recurse=True, parent=None):
     '''
     debug(opts, 'processing url {}'.format(url))
     url = clean_url(url)
+    debug(opts, 'cleaned url {}'.format(url))
     if proceed(url, opts, dups, depth) is False:
         debug(opts, 'ignoring url {}'.format(url))
         return
 
     response = openurl(url, opts)
     if response is None:
-        debug(opts, 'no repsonse for url {}'.format(url))
+        debug(opts, 'no response for url {}'.format(url))
         return
 
     info = response.info()
